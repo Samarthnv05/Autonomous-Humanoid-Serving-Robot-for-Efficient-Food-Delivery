@@ -1,0 +1,48 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+int eyeX = 64, eyeY = 32;  
+int moveDirX = 1, moveDirY = 1;
+
+void setup() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
+  display.clearDisplay();
+}
+
+void drawEyes(int x, int y) {
+  int eyeDistance = 40;
+
+  // Left eye outline
+  display.drawCircle(x - eyeDistance, y, 20, WHITE);
+  // Right eye outline
+  display.drawCircle(x + eyeDistance, y, 20, WHITE);
+
+  // Pupils
+  display.fillCircle(x - eyeDistance, y, 8, WHITE);
+  display.fillCircle(x + eyeDistance, y, 8, WHITE);
+}
+
+void loop() {
+  display.clearDisplay();
+
+  // Animate horizontal movement
+  eyeX += moveDirX;
+  if (eyeX > 80 || eyeX < 48) moveDirX *= -1;
+
+  // Slight up/down bobbing
+  eyeY += moveDirY;
+  if (eyeY > 36 || eyeY < 28) moveDirY *= -1;
+
+  drawEyes(eyeX, eyeY);
+
+  display.display();
+  delay(40);
+}

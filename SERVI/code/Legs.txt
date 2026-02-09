@@ -1,0 +1,823 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+
+// WiFi credentials
+char ssid[] = "add your hotspot name";
+char pass[] = "add your password name";
+WebServer server(80);
+// =====================
+// SERVO DECLARATION
+// =====================
+Servo servoM[12];
+
+// ESP32 SAFE SERVO PINS
+int servoPins[12] = {
+  2, 4, 5, 16, 17,
+  18, 19, 33, 32, 23,
+  25, 26
+};
+
+int servo_position[12];
+const float PI_F = 3.1415926;
+
+// =====================
+// MPU6050 VARIABLES
+// =====================
+#define MPU_ADDR 0x68
+
+float pitch = 0;
+float roll  = 0;
+
+// calibration offsets
+float pitchOffset = 0;
+float rollOffset  = 0;
+
+// balance tuning
+float BAL_KP = 1.2;   // start small
+
+// =====================
+// FALL DETECTION VARIABLES
+// =====================
+bool falling = false;
+unsigned long fallStartTime = 0;
+
+// fall angle limits (degrees)
+#define FALL_PITCH 35
+#define FALL_ROLL  35
+#define FALL_CONFIRM_TIME 120  // ms
+
+// balance strengths
+float BAL_KP_NORMAL = 0.4;     // smoother during walking
+float BAL_KP_EMERGENCY = 2.2; // strong but not jerky
+
+bool calibrating = false;
+unsigned long calStartTime = 0;
+float calPitchSum = 0;
+float calRollSum  = 0;
+int calSamples = 0;
+
+// =====================
+// WALK STATE
+// =====================
+enum MoveState {
+  STOPPED,
+  MOVING_FORWARD,
+  MOVING_BACKWARD,
+  TURN_RIGHT,
+  TURN_LEFT
+};
+
+#define MAX_PROGRAMS 5
+#define MAX_STEPS 40
+
+struct MotionStep {
+  MoveState dir;
+  unsigned long duration;
+};
+
+MotionStep programs[MAX_PROGRAMS][MAX_STEPS];
+int stepCount[MAX_PROGRAMS] = {0};
+
+bool playing = false;
+bool stepActive = false;
+
+bool recordMode = false;   // recording session ON/OFF
+bool playModeUI = false;  // for UI status only
+
+int currentProgram = 0;
+int playIndex = 0;
+unsigned long stepStartTime = 0;
+
+volatile MoveState moveState = STOPPED;
+MoveState lastMoveState = STOPPED;
+
+bool forwardPrepared = false;
+bool backwardPrepared = false;
+
+
+void handleRoot() {
+  server.send(200, "text/html", R"====(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Welcome Robot - Teach & Repeat</title>
+
+<style>
+body{
+  font-family: Arial;
+  background:#0f1114;
+  color:#fff;
+  text-align:center;
+  margin:0;
+}
+
+h2{ color:#00e0ff; margin:12px; }
+
+.panel{
+  border:1px solid #2a2a2a;
+  border-radius:14px;
+  padding:12px;
+  margin:12px auto;
+  max-width:360px;
+  background:#111;
+}
+
+.value{ font-size:18px; color:#00ff9c; }
+.alert{ color:#ff4040; font-weight:bold; }
+
+button{
+  border:none;
+  border-radius:10px;
+  cursor:pointer;
+  font-size:18px;
+  transition:0.15s;
+}
+
+/* ===== Status ===== */
+#statusDot{
+  width:16px;
+  height:16px;
+  border-radius:50%;
+  background:#777;
+  display:inline-block;
+  margin-left:6px;
+}
+
+.blink{ animation: blink 1s infinite; }
+@keyframes blink{
+  0%{opacity:1;}50%{opacity:.3;}100%{opacity:1;}
+}
+
+/* ===== Control buttons ===== */
+.ctrl{
+  width:78px;
+  height:56px;
+  background:#3a3a3a;
+  color:white;
+}
+.ctrl.active{
+  background:#00e0ff;
+  color:black;
+  box-shadow:0 0 12px #00e0ff;
+}
+
+.stop{
+  background:#444;
+}
+.stop.active{
+  background:#ff5555;
+  box-shadow:0 0 12px red;
+}
+
+/* ===== Program buttons ===== */
+.prog{
+  width:70px;
+  height:40px;
+  background:#333;
+  color:white;
+}
+.prog.active{
+  background:#ff9800;
+  color:black;
+  box-shadow:0 0 10px #ff9800;
+}
+
+/* ===== Actions ===== */
+.rec{ background:#b00000; color:white; width:130px; height:48px; }
+.run{ background:#008000; color:white; width:130px; height:48px; }
+.cal{ background:#0040ff; color:white; width:200px; height:44px; }
+
+</style>
+</head>
+
+<body>
+
+<h2>&#129302; Welcome Robot - Teach & Repeat</h2>
+
+<div class="panel">
+<b>Status</b>
+<span id="statusDot"></span>
+</div>
+
+<div class="panel">
+<div>Pitch: <span class="value" id="pitch">0</span>&deg;</div>
+<div>Roll : <span class="value" id="roll">0</span>&deg;</div>
+<div id="fall" class="alert"></div>
+<div id="calbox" class="value"></div>
+</div>
+
+<!-- ===== CONTROL PAD ===== -->
+<div class="panel">
+<table style="margin:auto">
+<tr>
+  <td></td>
+  <td><button class="ctrl" onclick="send('f',this)">&#9650;</button></td>
+  <td></td>
+</tr>
+<tr>
+  <td><button class="ctrl" onclick="send('r',this)">&#9664;</button></td>
+  <td><button class="ctrl stop" onclick="send('s',this)">&#9632;</button></td>
+  <td><button class="ctrl" onclick="send('l',this)">&#9654;</button></td>
+</tr>
+<tr>
+  <td></td>
+  <td><button class="ctrl" onclick="send('b',this)">&#9660;</button></td>
+  <td></td>
+</tr>
+</table>
+</div>
+
+<!-- ===== PROGRAMS ===== -->
+<div class="panel">
+<h3>Programs</h3>
+
+<div>
+  <button class="prog" onclick="prog(0,this)">P1</button>
+  <button class="prog" onclick="prog(1,this)">P2</button>
+  <button class="prog" onclick="prog(2,this)">P3</button>
+</div>
+
+<br>
+
+<div>
+  <button class="prog" onclick="prog(3,this)">P4</button>
+  <button class="prog" onclick="prog(4,this)">P5</button>
+</div>
+
+<br><br>
+
+<button class="rec" onclick="send('rec_toggle')">Record</button>
+<button class="run" onclick="send('run1')">Run</button>
+</div>
+
+
+<div class="panel">
+<button class="cal" onclick="send('cal')">Calibrate Balance (5s)</button>
+</div>
+
+<script>
+function clearActive(cls){
+ document.querySelectorAll(cls).forEach(b=>b.classList.remove('active'));
+}
+
+function send(c,btn){
+ if(btn){
+   clearActive('.ctrl');
+   btn.classList.add('active');
+   setTimeout(()=>btn.classList.remove('active'),200);
+ }
+ fetch('/cmd?c='+c)
+ .then(r=>r.text())
+ .then(state=>{
+   let dot=document.getElementById('statusDot');
+   dot.className='';
+   if(state==='REC'){ dot.style.background='red'; dot.classList.add('blink'); }
+   else if(state==='PLAY'){ dot.style.background='green'; }
+   else{ dot.style.background='#777'; }
+ });
+}
+
+function prog(n,btn){
+ clearActive('.prog');
+ btn.classList.add('active');
+ fetch('/cmd?c=prog'+n);
+}
+
+/* ===== Telemetry ===== */
+setInterval(()=>{
+ fetch('/cmd?c=tele')
+ .then(r=>r.json())
+ .then(d=>{
+   pitch.innerText=d.pitch.toFixed(1);
+   roll.innerText=d.roll.toFixed(1);
+   fall.innerText=d.fall?'⚠ FALL DETECTED':'';
+   calbox.innerText=d.cal?'Calibrating...'+d.calLeft+' s':'';
+ });
+},500);
+</script>
+
+</body>
+</html>
+)====");
+}
+
+
+void handleCmd() {
+
+  String c = server.arg("c");
+
+  // ================= TELEMETRY =================
+if (c == "tele") {
+
+  int calLeft = 0;
+  if (calibrating) {
+    long elapsed = (millis() - calStartTime) / 1000;
+    calLeft = 5 - elapsed;
+    if (calLeft < 0) calLeft = 0;
+  }
+
+  String json = "{";
+  json += "\"pitch\":" + String(pitch) + ",";
+  json += "\"roll\":" + String(roll) + ",";
+  json += "\"fall\":" + String(falling ? "true" : "false") + ",";
+  json += "\"cal\":" + String(calibrating ? "true" : "false") + ",";
+  json += "\"calLeft\":" + String(calLeft);
+  json += "}";
+
+  server.send(200, "application/json", json);
+  return;
+}
+
+
+  // ================= PROGRAM SELECT =================
+  if (c.startsWith("prog")) {
+    int p = c.substring(4).toInt();  // prog0..prog4
+
+    if (p >= 0 && p < MAX_PROGRAMS) {
+      currentProgram = p;
+
+      // stop everything when switching program
+      recordMode = false;
+      playing = false;
+      stepActive = false;
+      moveState = STOPPED;
+      initial_position();
+    }
+
+    server.send(200, "text/plain", "IDLE");
+    return;
+  }
+
+
+  // ================= RECORD TOGGLE =================
+  if (c == "rec_toggle") {
+
+    // STOP EVERYTHING first
+    moveState = STOPPED;
+    stepActive = false;
+    initial_position();
+
+    recordMode = !recordMode;
+
+    if (recordMode) {
+      stepCount[currentProgram] = 0;   // clear old program
+      server.send(200, "text/plain", "REC");   // 🔴 blink
+    } else {
+      server.send(200, "text/plain", "IDLE");  // ⚪
+    }
+    return;
+  }
+
+  // ================= RUN =================
+  if (c == "run1") {
+
+    // stop recording if active
+    recordMode = false;
+    stepActive = false;
+
+    if (stepCount[currentProgram] == 0) {
+      server.send(200, "text/plain", "IDLE");
+      return;
+    }
+
+    playing = true;
+    playIndex = 0;
+    stepStartTime = millis();
+    moveState = programs[currentProgram][0].dir;
+
+    server.send(200, "text/plain", "PLAY"); // 🟢
+    return;
+  }
+
+  // ================= STOP =================
+  if (c == "s") {
+
+    // save step ONLY if recording
+    if (recordMode && stepActive && stepCount[currentProgram] < MAX_STEPS) {
+
+      unsigned long duration = millis() - stepStartTime;
+
+      if (duration > 150) {  // ignore accidental taps
+        programs[currentProgram][stepCount[currentProgram]].dir = moveState;
+        programs[currentProgram][stepCount[currentProgram]].duration = duration;
+        stepCount[currentProgram]++;
+      }
+    }
+
+    // HARD STOP
+    stepActive = false;
+    moveState = STOPPED;
+    initial_position();
+
+    server.send(200, "text/plain", recordMode ? "REC" : "IDLE");
+    return;
+  }
+
+  // ================= DIRECTION COMMANDS =================
+  if (c == "f" || c == "b" || c == "l" || c == "r") {
+
+    // ❗ ONLY allow movement when recording
+    if (!recordMode || stepActive) {
+      server.send(200, "text/plain", recordMode ? "REC" : "IDLE");
+      return;
+    }
+
+    // start new step
+    stepStartTime = millis();
+    stepActive = true;
+
+    if (c == "f") moveState = MOVING_FORWARD;
+    else if (c == "b") moveState = MOVING_BACKWARD;
+    else if (c == "l") moveState = TURN_LEFT;
+    else if (c == "r") moveState = TURN_RIGHT;
+
+    server.send(200, "text/plain", "REC");
+    return;
+  }
+
+  // ================= CALIBRATION =================
+if (c == "cal") {
+
+  if (!playing && !recordMode) {
+    calibrating = true;
+    calStartTime = millis();
+    calPitchSum = 0;
+    calRollSum = 0;
+    calSamples = 0;
+  }
+
+  server.send(200, "text/plain", "CAL");
+  return;
+}
+
+
+  server.send(200, "text/plain", recordMode ? "REC" : "IDLE");
+}
+
+// =====================
+// SMOOTH MOVE FUNCTION (12 SERVOS)
+// =====================
+void move_servo_12(int totalTime, const int target[]) {
+
+  int start[12];
+  for (int i = 0; i < 12; i++) start[i] = servo_position[i];
+
+  if (totalTime < 40) totalTime = 40;
+  int steps = totalTime / 15;
+  if (steps < 1) steps = 1;
+
+  for (int s = 1; s <= steps; s++) {
+    float t = (float)s / steps;
+    float ease = 0.5 - 0.5 * cos(t * PI_F);
+
+    for (int i = 0; i < 12; i++) {
+      int pos = start[i] + (target[i] - start[i]) * ease;
+      servoM[i].write(pos);
+    }
+    delay(15);
+  }
+
+  for (int i = 0; i < 12; i++) servo_position[i] = target[i];
+}
+
+// =====================
+// NEUTRAL POSITION
+// =====================
+const int NEUTRAL[12] = {90,150,150,30,90,  90,30,30,150,90,  90,90};
+
+void initial_position() {
+  for (int i = 0; i < 12; i++) {
+    servoM[i].write(NEUTRAL[i]);
+    servo_position[i] = NEUTRAL[i];
+  }
+  delay(600);
+}
+
+// =====================
+// FORWARD
+// =====================
+void forward_prepare(int speed) {
+  const int A1[12] = {90,150,150,30,90,  90,30,30,150,90,  90,90};
+  const int A2[12] = {110,150,150,30,110,  90,30,30,150,90,  90,90};
+  const int A3[12] = {110,150,120,65,110,  90,30,30,150,90,  90,90};
+  const int A4[12] = {90,150,120,65,90,  90,30,30,150,90,  90,90};
+
+  move_servo_12(speed, A1);
+  move_servo_12(speed, A2);
+  move_servo_12(speed, A3);
+  move_servo_12(speed, A4);
+}
+
+void forward_step_once(int speed) {
+// {R_Foot, R_LowerLeg, R_Knee, R_UpperLeg, R_Hip,       L_Foot, L_LowerLeg, L_Knee, L_UpperLeg, L_Hip,         R_Body_Top1, L_Body_Top2}
+// const int NEUTRAL[12] = {90,150,150,30,90,   90,30,30,150,90,   90,90};
+  const int A5[12]  = {80,150,150,30,90,  70,30,30,150,70,  90,90};
+  const int A6[12]  = {80,150,150,30,90,  70,30,60,115,70,  90,90};
+  const int A7[12]  = {90,150,150,30,90,  90,30,60,115,90,  90,90};
+  const int A8[12]  = {110,150,150,30,110, 105,30,30,150,90,  90,90};
+  const int A9[12]  = {110,150,120,65,110, 105,30,30,150,90,  90,90};
+  const int A10[12] = {90,150,120,65,90,  90,30,30,150,90,  90,90};
+
+  move_servo_12(speed, A5);
+  move_servo_12(speed, A6);
+  move_servo_12(speed, A7);
+  move_servo_12(speed, A8);
+  move_servo_12(speed, A9);
+  move_servo_12(speed, A10);
+}
+
+// =====================
+// BACKWARD (ADDED – SAME AS YOUR 10 SERVO LOGIC)
+// =====================
+void backward_prepare(int speed) {
+  const int A1[12] = {90,150,150,30,90,  90,30,30,150,90,  90,90};
+  const int A2[12] = {110,150,150,30,110,  90,30,30,150,90,  90,90};
+  const int A3[12] = {110,150,160,5,110,  90,30,30,150,90,  90,90};
+  const int A4[12] = {90,150,160,5,90,  90,30,30,150,90,  90,90};
+
+  move_servo_12(speed, A1);
+  move_servo_12(speed, A2);
+  move_servo_12(speed, A3);
+  move_servo_12(speed, A4);
+}
+
+void backward_step_once(int speed) {
+// {R_Foot, R_LowerLeg, R_Knee, R_UpperLeg, R_Hip,       L_Foot, L_LowerLeg, L_Knee, L_UpperLeg, L_Hip,         R_Body_Top1, L_Body_Top2}
+// const int NEUTRAL[12] = {90,150,150,30,90,   90,30,30,150,90,   90,90};
+  const int A5[12]  = {80,150,150,30,90,  70,30,30,150,70,  90,90};
+  const int A6[12]  = {80,150,150,30,90,  70,30,20,170,70,  90,90};
+  const int A7[12]  = {90,150,150,30,90,  90,30,20,170,90,  90,90};
+  const int A8[12]  = {110,150,150,30,110, 105,30,30,150,90,  90,90};
+  const int A9[12]  = {110,150,160,5,110, 105,30,30,150,90,  90,90};
+  const int A10[12] = {90,150,160,5,90,  90,30,30,150,90,  90,90};
+
+  move_servo_12(speed, A5);
+  move_servo_12(speed, A6);
+  move_servo_12(speed, A7);
+  move_servo_12(speed, A8);
+  move_servo_12(speed, A9);
+  move_servo_12(speed, A10);
+}
+
+// =====================
+// RIGHT / LEFT (UNCHANGED)
+// =====================
+void right_step_once(int speed) {
+  // {R_Foot, R_LowerLeg, R_Knee, R_UpperLeg, R_Hip,       L_Foot, L_LowerLeg, L_Knee, L_UpperLeg, L_Hip,         R_Body_Top1, L_Body_Top2}
+// const int NEUTRAL[12] = {90,150,150,30,90,   90,30,30,150,90,   90,90};
+  const int A5[12]  = {70,150,150,30,90,  70,30,30,150,70,  90,90};
+  const int A6[12]  = {70,150,150,30,90,  70,30,30,150,70,  70,90};
+  const int A7[12]  = {90,150,150,30,90,  90,30,30,150,90,  70,90};
+  const int A8[12]  = {110,150,150,30,110, 110,30,30,150,90,  70,90};
+  const int A9[12]  = {110,150,150,30,110, 110,30,30,150,90,  90,90};
+  const int A10[12] = {90,150,150,30,90,  90,30,30,150,90,  90,90};
+
+  move_servo_12(speed, A5);
+  move_servo_12(speed, A6);
+  move_servo_12(speed, A7);
+  move_servo_12(speed, A8);
+  move_servo_12(speed, A9);
+  move_servo_12(speed, A10);
+}
+
+void left_step_once(int speed) {
+  // {R_Foot, R_LowerLeg, R_Knee, R_UpperLeg, R_Hip,       L_Foot, L_LowerLeg, L_Knee, L_UpperLeg, L_Hip,         R_Body_Top1, L_Body_Top2}
+// const int NEUTRAL[12] = {90,150,150,30,90,   90,30,30,150,90,   90,90};
+  const int A5[12]  = {110,150,150,30,110,    110,30,30,150,90,    90,90};
+  const int A6[12]  = {110,150,150,30,110,    110,30,30,150,90,    90,110};
+  const int A7[12]  = {90,150,150,30,90,    90,30,30,150,90,    90,110};
+  const int A8[12]  = {70,150,150,30,90,    70,30,30,150,70,    90,110};
+  const int A9[12]  = {70,150,150,30,90,    70,30,30,150,70,    90,90};
+  const int A10[12] = {90,150,150,30,90,    90,30,30,150,90,    90,90};
+
+  move_servo_12(speed, A5);
+  move_servo_12(speed, A6);
+  move_servo_12(speed, A7);
+  move_servo_12(speed, A8);
+  move_servo_12(speed, A9);
+  move_servo_12(speed, A10);
+}
+
+// =====================
+// SETUP
+// =====================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println();
+  Serial.println("=== Welcome Robot Booting ===");
+
+  // ================= SERVO INIT =================
+  for (int i = 0; i < 12; i++) {
+    servoM[i].attach(servoPins[i], 500, 2500);
+    servo_position[i] = 90;
+  }
+  Serial.println("Servos attached");
+
+  // ================= MPU INIT =================
+  Wire.begin(21, 22);   // SDA, SCL
+  delay(100);
+
+  // Wake up MPU6050
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(200);
+
+  Serial.println("MPU6050 initialized");
+
+  // ================= WIFI CONNECT =================
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(ssid);
+
+  WiFi.begin(ssid, pass);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected successfully!");
+  Serial.print("ESP32 IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // ================= WEB SERVER =================
+  server.on("/", handleRoot);
+  server.on("/cmd", handleCmd);
+  server.begin();
+
+  Serial.println("Web server started");
+  Serial.println("Open browser and enter IP address above");
+
+  // ================= INITIAL POSITION =================
+  initial_position();
+
+  Serial.println("Robot ready ✅");
+}
+
+
+void readMPU() {
+  int16_t ax, ay, az;
+
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);              // ACCEL_XOUT_H
+  Wire.endTransmission(false);
+
+  Wire.requestFrom((uint16_t)MPU_ADDR, (uint8_t)6, (uint8_t)true);
+
+  ax = (Wire.read() << 8) | Wire.read();
+  ay = (Wire.read() << 8) | Wire.read();
+  az = (Wire.read() << 8) | Wire.read();
+
+  pitch = atan2(ax, sqrt((float)ay * ay + (float)az * az)) * 57.2958;
+  roll  = atan2(ay, sqrt((float)ax * ax + (float)az * az)) * 57.2958;
+}
+
+void checkFall() {
+
+  bool overLimit =
+    abs(pitch - pitchOffset) > FALL_PITCH ||
+    abs(roll  - rollOffset)  > FALL_ROLL;
+
+  if (overLimit) {
+    if (!falling) {
+      if (millis() - fallStartTime > FALL_CONFIRM_TIME) {
+        falling = true;
+      }
+    }
+  } else {
+    fallStartTime = millis();  // reset timer
+    falling = false;
+  }
+}
+
+
+void applyBalance() {
+
+  float pErr = pitch - pitchOffset;
+  float rErr = roll  - rollOffset;
+
+  // ===== DEAD ZONE (ignore tiny noise) =====
+  if (abs(pErr) < 1.2) pErr = 0;
+  if (abs(rErr) < 1.2) rErr = 0;
+
+  float kp = falling ? BAL_KP_EMERGENCY : BAL_KP_NORMAL;
+
+int pitchCorr = constrain(pErr * kp, -5, 5);
+int rollCorr  = constrain(rErr * kp, -5, 5);
+
+  // ===== HIP SERVOS =====
+  servoM[4].write(constrain(servo_position[4] - pitchCorr, 60, 120));
+  servoM[9].write(constrain(servo_position[9] - pitchCorr, 60, 120));
+
+  // ===== BODY TOP SERVOS =====
+servoM[10].write(constrain(servo_position[10] + rollCorr, 70, 110));
+servoM[11].write(constrain(servo_position[11] - rollCorr, 70, 110));
+}
+
+
+
+
+// =====================
+// LOOP
+// =====================
+void loop() {
+
+  // ===== Web server =====
+  server.handleClient();
+
+  // ===== HARD STOP SAFETY RESET =====
+  if (moveState == STOPPED) {
+    forwardPrepared = false;
+    backwardPrepared = false;
+  }
+
+  // ===== Playback engine =====
+  if (playing) {
+    if (millis() - stepStartTime >= programs[currentProgram][playIndex].duration) {
+      playIndex++;
+
+      if (playIndex >= stepCount[currentProgram]) {
+        playing = false;
+        playModeUI = false;
+        moveState = STOPPED;
+        initial_position();
+      } else {
+        moveState = programs[currentProgram][playIndex].dir;
+        stepStartTime = millis();
+      }
+    }
+  }
+
+  readMPU();
+
+  // ===== CALIBRATION PROCESS =====
+if (calibrating) {
+
+  calPitchSum += pitch;
+  calRollSum  += roll;
+  calSamples++;
+
+if (millis() - calStartTime >= 5000) {
+  pitchOffset = calPitchSum / calSamples;
+  rollOffset  = calRollSum  / calSamples;
+  calibrating = false;
+
+  // Reset balance memory
+  initial_position();
+  delay(400);
+}
+
+
+  moveState = STOPPED;   // no movement
+  return;                // skip rest of loop
+}
+
+checkFall();
+
+// Apply balance always (except calibration)
+if (!calibrating) {
+  applyBalance();
+}
+
+
+
+  // ===== EMERGENCY FALL RESPONSE =====
+  if (falling) {
+    moveState = STOPPED;
+    initial_position();
+    return;
+  }
+
+  // ===== STATE CHANGE TRACKING =====
+  if (moveState != lastMoveState) {
+    if (moveState == STOPPED) initial_position();
+    forwardPrepared = false;
+    backwardPrepared = false;
+    lastMoveState = moveState;
+  }
+
+  // ===== GAIT EXECUTION =====
+  if (moveState == MOVING_FORWARD) {
+    if (!forwardPrepared) {
+      forward_prepare(650);
+      forwardPrepared = true;
+    }
+    forward_step_once(650);
+  }
+  else if (moveState == MOVING_BACKWARD) {
+    if (!backwardPrepared) {
+      backward_prepare(450);
+      backwardPrepared = true;
+    }
+    backward_step_once(450);
+  }
+  else if (moveState == TURN_RIGHT) right_step_once(450);
+  else if (moveState == TURN_LEFT)  left_step_once(450);
+}
