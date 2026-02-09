@@ -96,7 +96,9 @@ These results demonstrate reliable operation for controlled indoor service envir
 ## 👥 Team
 
 - **Samarth N Vernekar** – Embedded Systems & System Integration  
-- Team Members  
+-  **T R Thirumala Venu** - Electrical integration & assmbely
+-  **DV Darshan** - Mechanical parts & assmbely
+-  **Madhu UK** - 3D Modeling & PCB design 
 
 ---
 
